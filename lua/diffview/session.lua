@@ -8,7 +8,8 @@
 -- cursor and viewport via `winrestview`.
 --
 -- Gated by `restore_session` (default true). When false, the cleanup pass
--- still runs but save and restore are skipped.
+-- still runs but save and restore are skipped. With `restore_session_lazy`,
+-- each view waits in its tab until that tab is first entered.
 
 local api = vim.api
 
@@ -180,6 +181,34 @@ local function enabled()
   return config.get_config().restore_session ~= false
 end
 
+---Returns `true` if `restore_session_lazy` is set.
+---@return boolean
+local function lazy()
+  local ok, config = pcall(require, "diffview.config")
+  return ok and config.get_config().restore_session_lazy == true
+end
+
+-- With `restore_session_lazy`: the views of the loaded session that have yet
+-- to open, by the tab standing in for each.
+---@type table<integer, diffview.session.ViewEntry>
+local pending = {}
+
+---Returns `true` if `tab` stands in for a view and still shows the
+---placeholder `reserve` left, which loading another session replaces.
+---@param tab integer
+---@return boolean
+local function is_reserved(tab)
+  if not (pending[tab] and api.nvim_tabpage_is_valid(tab)) then
+    return false
+  end
+  for _, win in ipairs(api.nvim_tabpage_list_wins(tab)) do
+    if vim.b[api.nvim_win_get_buf(win)].diffview_session_placeholder then
+      return true
+    end
+  end
+  return false
+end
+
 ---Returns the 1-based tabnr of `tabpage`, or a large sentinel if invalid
 ---(so it sorts last).
 ---@param tabpage integer
@@ -306,6 +335,14 @@ function M.save()
     local entry = capture_view(view)
     if entry then
       entries[#entries + 1] = entry
+    end
+  end
+  -- A view never opened is saved as it was loaded, at its tab's position.
+  for tab, entry in pairs(pending) do
+    if is_reserved(tab) then
+      local copy = vim.deepcopy(entry)
+      copy.tabpage_order = api.nvim_tabpage_get_number(tab)
+      entries[#entries + 1] = copy
     end
   end
 
@@ -493,8 +530,109 @@ local function restore_file_history_entry(lib, entry)
   end
 end
 
+---Returns `true` if a view of `lib` has a tab.
+---@param lib any
+---@return boolean
+local function has_live_view(lib)
+  for _, view in ipairs(lib.views or {}) do
+    if view.tabpage and api.nvim_tabpage_is_valid(view.tabpage) then
+      return true
+    end
+  end
+  return false
+end
+
+---Open the views of `entries`, each in a new tab after the current one.
+---@param lib any
+---@param entries diffview.session.ViewEntry[]
+local function restore_entries(lib, entries)
+  -- Set before any `lib.diffview_open` (which can yield); pcall-wrap so
+  -- a throw doesn't leave the guard latched.
+  restore_in_progress = true
+  local ok, err = pcall(function()
+    for _, entry in ipairs(entries) do
+      if entry.kind == "diffview_open" then
+        restore_diffview_entry(lib, entry)
+      elseif entry.kind == "file_history" then
+        restore_file_history_entry(lib, entry)
+      end
+    end
+  end)
+  restore_in_progress = false
+  if not ok then
+    warn_failed(err)
+  end
+end
+
+---Returns `true` if `tab` shows a `diffview://` buffer, as the copy of a
+---view's tab that a sourced session leaves does.
+---@param tab integer
+---@return boolean
+local function is_view_copy(tab)
+  for _, win in ipairs(api.nvim_tabpage_list_wins(tab)) do
+    if api.nvim_buf_get_name(api.nvim_win_get_buf(win)):match("^diffview://") then
+      return true
+    end
+  end
+  return false
+end
+
+---Empty `tab` down to one window showing a placeholder, and have it stand in
+---for `entry` until it is entered. The stale buffers it showed are left for
+---`cleanup` to wipe.
+---@param tab integer
+---@param entry diffview.session.ViewEntry
+local function reserve(tab, entry)
+  local buf = api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = "wipe"
+  vim.b[buf].diffview_session_placeholder = true
+  local command = entry.kind == "file_history" and "DiffviewFileHistory" or "DiffviewOpen"
+  api.nvim_buf_set_lines(buf, 0, -1, false, {
+    (":%s opens when this tab is entered."):format(
+      table.concat(vim.list_extend({ command }, entry.args), " ")
+    ),
+  })
+  vim.bo[buf].modifiable = false
+
+  local wins = vim.tbl_filter(function(win)
+    return api.nvim_win_get_config(win).relative == ""
+  end, api.nvim_tabpage_list_wins(tab))
+  api.nvim_win_set_buf(wins[1], buf)
+  api.nvim_win_call(wins[1], function()
+    vim.cmd("diffoff")
+  end)
+  for i = 2, #wins do
+    api.nvim_win_close(wins[i], true)
+  end
+  pending[tab] = entry
+end
+
+---Open the view `tab` stands in for, and close `tab` so the view takes its
+---position. Only while `tab` is current: a view opens after the current tab.
+---@param tab integer
+local function open_reserved(tab)
+  local entry = pending[tab]
+  if not entry or api.nvim_get_current_tabpage() ~= tab then
+    return
+  end
+  pending[tab] = nil
+  restore_entries(require("diffview.lib"), { entry })
+  local view_tab = api.nvim_get_current_tabpage()
+  if view_tab ~= tab and api.nvim_tabpage_is_valid(tab) then
+    vim.cmd("tabclose " .. api.nvim_tabpage_get_number(tab))
+    -- `TabClosed` hooks may move to another tab, taking the closed one for
+    -- the current one.
+    if api.nvim_tabpage_is_valid(view_tab) then
+      api.nvim_set_current_tabpage(view_tab)
+    end
+  end
+end
+
 ---Re-open the diffview views captured in the sidecar associated with the
----current session, in approximately their original tab order.
+---current session, in approximately their original tab order. With
+---`restore_session_lazy`, each view whose tab the session restored waits in
+---that tab until it is entered; call this before `cleanup`, which would
+---close those tabs.
 function M.restore()
   if restore_in_progress then
     return
@@ -528,10 +666,8 @@ function M.restore()
 
   -- If a view is already live (e.g., from `-c DiffviewOpen ...` or a
   -- user's own autocmd), honour that instead of overwriting it.
-  for _, view in ipairs(lib.views or {}) do
-    if view.tabpage and api.nvim_tabpage_is_valid(view.tabpage) then
-      return
-    end
+  if has_live_view(lib) then
+    return
   end
 
   -- Defensive: a hand-edited sidecar may have non-numeric tabpage_order.
@@ -541,22 +677,62 @@ function M.restore()
     return ao < bo
   end)
 
-  -- Set before any `lib.diffview_open` (which can yield); pcall-wrap so
-  -- a throw doesn't leave the guard latched.
-  restore_in_progress = true
-  local ok, err = pcall(function()
-    for _, entry in ipairs(entries) do
-      if entry.kind == "diffview_open" then
-        restore_diffview_entry(lib, entry)
-      elseif entry.kind == "file_history" then
-        restore_file_history_entry(lib, entry)
-      end
-    end
-  end)
-  restore_in_progress = false
-  if not ok then
-    warn_failed(err)
+  if not lazy() then
+    restore_entries(lib, entries)
+    return
   end
+
+  for tab in pairs(pending) do
+    if not is_reserved(tab) then
+      pending[tab] = nil
+    end
+  end
+  -- Tabs are taken by position before any of them opens or closes.
+  local tabs = api.nvim_list_tabpages()
+  local taken = {}
+  local now = {}
+  for _, entry in ipairs(entries) do
+    local tab = type(entry.tabpage_order) == "number" and tabs[entry.tabpage_order] or nil
+    if tab and is_reserved(tab) and not taken[tab] then
+      -- Already standing in, from an earlier restore of the same load.
+      taken[tab] = true
+    elseif
+      (entry.kind == "diffview_open" or entry.kind == "file_history")
+      and type(entry.args) == "table"
+      and tab
+      and not taken[tab]
+      and is_view_copy(tab)
+    then
+      reserve(tab, entry)
+      taken[tab] = true
+    else
+      now[#now + 1] = entry
+    end
+  end
+
+  local group = api.nvim_create_augroup("diffview_session_lazy", { clear = true })
+  if next(pending) then
+    api.nvim_create_autocmd("TabEnter", {
+      group = group,
+      callback = function()
+        local tab = api.nvim_get_current_tabpage()
+        if pending[tab] then
+          -- Opening a view inside `TabEnter` would nest in its context.
+          vim.schedule(function()
+            open_reserved(tab)
+          end)
+        end
+      end,
+    })
+  end
+
+  -- Past the caller's `cleanup`, like an eager restore.
+  vim.schedule(function()
+    if #now > 0 and not has_live_view(lib) then
+      restore_entries(lib, now)
+    end
+    open_reserved(api.nvim_get_current_tabpage())
+  end)
 end
 
 ---Record the args used to create `view` so they can be re-invoked on
@@ -612,6 +788,13 @@ function M.setup()
       session_file_changed()
       vim.schedule(function()
         local _, created_paths = read_sidecar()
+        if lazy() then
+          -- Views wait in their tabs, taken by position, which closing
+          -- stale tabs would shift.
+          M.restore()
+          cleanup(created_paths)
+          return
+        end
         cleanup(created_paths)
         -- Defer restore so TabClosed/WinClosed autocmds queued by
         -- cleanup fire before any view is created.

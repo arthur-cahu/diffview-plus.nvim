@@ -771,6 +771,168 @@ describe("session save/restore", function()
       }, captured.cursor_map)
     end)
 
+    describe("with `restore_session_lazy`", function()
+      local opened
+      local copy_count = 0
+
+      before_each(function()
+        config.get_config().restore_session_lazy = true
+        opened = {}
+        lib.diffview_open = function(args)
+          table.insert(invocations, { fn = "diffview_open", args = args })
+          local view = { options = {} }
+          -- Like `View:open`: a new tab after the current one.
+          function view.open(self)
+            vim.cmd("tab split")
+            self.tabpage = api.nvim_get_current_tabpage()
+          end
+          table.insert(opened, view)
+          return view
+        end
+      end)
+
+      ---Open a tab like the one a sourced session leaves for a view: a
+      ---stale `diffview://` buffer beside a file.
+      ---@return integer tabpage
+      local function view_copy_tab()
+        copy_count = copy_count + 1
+        local tab =
+          open_tab_with(make_buf(("diffview:///repo/.git/abc/lazy%d.lua"):format(copy_count)))
+        vim.cmd("vsplit")
+        api.nvim_set_current_buf(api.nvim_create_buf(true, false))
+        return tab
+      end
+
+      ---@param tabpage_order integer
+      local function write_sidecar(tabpage_order)
+        local f = assert(io.open(tmp_session .. ".diffview.json", "w"))
+        f:write(vim.json.encode({
+          version = 1,
+          views = { { kind = "diffview_open", args = { "HEAD" }, tabpage_order = tabpage_order } },
+        }))
+        f:close()
+      end
+
+      ---Run the callbacks `restore` and `TabEnter` schedule.
+      local function flush()
+        vim.wait(50, function()
+          return false
+        end)
+      end
+
+      it("leaves a placeholder in the view's tab instead of opening it", function()
+        local copy = view_copy_tab()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+
+        session.restore()
+        flush()
+
+        assert.equals(0, #invocations)
+        local wins = api.nvim_tabpage_list_wins(copy)
+        assert.equals(1, #wins)
+        local buf = api.nvim_win_get_buf(wins[1])
+        assert.equals("", api.nvim_buf_get_name(buf))
+        assert.equals("nofile", vim.bo[buf].buftype)
+      end)
+
+      it("opens the view in its tab's position when the tab is entered", function()
+        view_copy_tab()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+
+        session.restore()
+        flush()
+        vim.cmd("tabnext 2")
+        flush()
+
+        assert.equals(1, #invocations)
+        assert.are.same({ "HEAD" }, invocations[1].args)
+        assert.equals(3, #api.nvim_list_tabpages())
+        assert.equals(opened[1].tabpage, api.nvim_get_current_tabpage())
+        assert.equals(2, api.nvim_tabpage_get_number(opened[1].tabpage))
+      end)
+
+      it("stays on the opened view when a `TabClosed` hook moves away", function()
+        view_copy_tab()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+        local group = api.nvim_create_augroup("diffview_session_test_tabclosed", {})
+        api.nvim_create_autocmd("TabClosed", {
+          group = group,
+          callback = function()
+            vim.cmd("tabfirst")
+          end,
+        })
+
+        session.restore()
+        flush()
+        vim.cmd("tabnext 2")
+        flush()
+        api.nvim_del_augroup_by_id(group)
+
+        assert.equals(opened[1].tabpage, api.nvim_get_current_tabpage())
+      end)
+
+      it("opens the view at once when the session ends on its tab", function()
+        view_copy_tab()
+        write_sidecar(2)
+
+        session.restore()
+        flush()
+
+        assert.equals(1, #invocations)
+        assert.equals(2, #api.nvim_list_tabpages())
+        assert.equals(2, api.nvim_tabpage_get_number(opened[1].tabpage))
+      end)
+
+      it("saves a view never opened at its tab's current position", function()
+        view_copy_tab()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+
+        session.restore()
+        flush()
+        vim.cmd("tabclose 1")
+        session.save()
+
+        local f = assert(io.open(tmp_session .. ".diffview.json", "r"))
+        local saved = vim.json.decode(f:read("*a"))
+        f:close()
+        assert.equals(1, #saved.views)
+        assert.are.same({ "HEAD" }, saved.views[1].args)
+        assert.equals(1, saved.views[1].tabpage_order)
+      end)
+
+      it("keeps the placeholder when restore runs twice for one load", function()
+        -- Both the `SessionLoadPost` hook and a session manager's hook may
+        -- call `restore`.
+        local copy = view_copy_tab()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+
+        session.restore()
+        session.restore()
+        flush()
+
+        assert.equals(0, #invocations)
+        assert.equals(3, #api.nvim_list_tabpages())
+        assert.equals(1, #api.nvim_tabpage_list_wins(copy))
+      end)
+
+      it("opens a view whose tab the session did not restore as before", function()
+        vim.cmd("tabnew")
+        write_sidecar(2)
+        vim.cmd("tabfirst")
+
+        session.restore()
+        flush()
+
+        assert.equals(1, #invocations)
+        assert.equals(3, #api.nvim_list_tabpages())
+      end)
+    end)
+
     it("is a no-op when no sidecar exists", function()
       assert.has_no.errors(session.restore)
       assert.equals(0, #invocations)

@@ -847,6 +847,15 @@ restore_session                                 *diffview-config-restore_session
 
         See |diffview.changelog-session-restoration|.
 
+restore_session_lazy                       *diffview-config-restore_session_lazy*
+        Type: `boolean`, Default: `false`
+
+        With |diffview-config-restore_session|, open each restored view
+        only when its tab is first entered, so loading a session does not
+        wait for the views' git calls and layouts. Until then, the tab the
+        session restored for the view holds a placeholder, and saving the
+        session keeps the view at that tab's position.
+
 icons                                           *diffview-config-icons*
         Type: `table`, Default: (see defaults)
 

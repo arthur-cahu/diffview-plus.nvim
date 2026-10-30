@@ -40,6 +40,7 @@ DEFAULT CONFIG                                  *diffview.defaults*
     diffopt = {},             -- Override diffopt settings while diffview is open. Restored on close.
     clean_up_buffers = false, -- Delete file buffers created by diffview on close.
     restore_session = true,   -- Restore open Diffview/FileHistory views from a sourced Vim session.
+    restore_session_lazy = false, -- Open each restored view when its tab is first entered.
     persist_selections = {
       enabled = false,        -- Persist file selections and hide-reviewed state across Neovim restarts.
       path = nil,             -- Storage path. Nil uses stdpath("data") .. "/diffview_selections.json".

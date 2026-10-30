@@ -147,6 +147,7 @@ local conflict_keymaps = {
 ---@field clean_up_buffers boolean
 ---@field persist_selections DiffviewPersistSelectionsConfig
 ---@field restore_session boolean
+---@field restore_session_lazy boolean
 ---@field icons DiffviewIcons
 ---@field status_icons DiffviewStatusIcons
 ---@field signs DiffviewSigns
@@ -180,6 +181,7 @@ local conflict_keymaps = {
 ---@field clean_up_buffers? boolean Delete file buffers created by diffview on close.
 ---@field persist_selections? DiffviewPersistSelectionsConfig.user Persist file selections and hide-reviewed state across Neovim restarts.
 ---@field restore_session? boolean Restore open Diffview/FileHistory views from a sourced Vim session.
+---@field restore_session_lazy? boolean Open each restored view when its tab is first entered.
 ---@field icons? DiffviewIcons.user Folder icons; only applies when `use_icons` is true.
 ---@field status_icons? DiffviewStatusIcons.user Icons for git status letters.
 ---@field signs? DiffviewSigns.user Sign characters used throughout the UI.
@@ -232,6 +234,7 @@ M.defaults = {
     path = nil, -- Storage path. Nil uses stdpath("data") .. "/diffview_selections.json".
   },
   restore_session = true, -- Restore open Diffview/FileHistory views from a sourced Vim session.
+  restore_session_lazy = false, -- Open each restored view when its tab is first entered.
 
   ---@class DiffviewIcons
   ---@field folder_closed string
@@ -1567,6 +1570,7 @@ function M.setup(user_config)
   validate.table(c, "diffopt", d.diffopt)
   validate.boolean(c, "clean_up_buffers", d.clean_up_buffers)
   validate.boolean(c, "restore_session", d.restore_session)
+  validate.boolean(c, "restore_session_lazy", d.restore_session_lazy)
 
   -- persist_selections
   validate.table(c, "persist_selections", d.persist_selections)
