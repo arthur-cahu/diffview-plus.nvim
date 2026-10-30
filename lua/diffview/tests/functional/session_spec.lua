@@ -529,6 +529,28 @@ describe("session save/restore", function()
       assert.is_nil(io.open(sidecar, "r"))
     end)
 
+    it("ignores the SessionWritePost that `:mkview` fires", function()
+      -- Plugins such as nvim-ufo run `:mkview` to read folds. Saving then
+      -- rewrites the sidecar on every fold update, and deletes it while a
+      -- restore has yet to reopen the views.
+      vim.cmd("mksession! " .. vim.fn.fnameescape(tmp_session))
+      session.setup()
+      local sidecar = tmp_session .. ".diffview.json"
+      local f = assert(io.open(sidecar, "w"))
+      f:write("{}")
+      f:close()
+      lib.views = {}
+
+      local view_file = vim.fn.tempname()
+      vim.cmd("mkview! " .. vim.fn.fnameescape(view_file))
+      os.remove(view_file)
+      assert.is_not_nil(io.open(sidecar, "r"))
+
+      -- A session write still saves, here removing the sidecar of no views.
+      vim.cmd("mksession! " .. vim.fn.fnameescape(tmp_session))
+      assert.is_nil(io.open(sidecar, "r"))
+    end)
+
     it("skips views that were never recorded", function()
       lib.views = {
         fake_view({ tabpage = api.nvim_get_current_tabpage() }), -- no `_session_record`

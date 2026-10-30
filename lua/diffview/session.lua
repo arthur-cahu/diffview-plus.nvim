@@ -576,10 +576,32 @@ function M.record_view(view, kind, args, range)
   }
 end
 
+-- `:mkview` fires `SessionWritePost` too (nvim-ufo runs it to read folds),
+-- without touching `v:this_session` or the file it names. A session write is
+-- told apart by that file's mtime changing.
+---@type string?
+local seen_session_file
+
+---Returns `true` if the session file changed since the previous call.
+---@return boolean
+local function session_file_changed()
+  local path = vim.v.this_session
+  local stat = path ~= "" and vim.uv.fs_stat(path) or nil
+  if not stat then
+    return false
+  end
+  local key = ("%s:%d:%d"):format(path, stat.mtime.sec, stat.mtime.nsec)
+  local changed = key ~= seen_session_file
+  seen_session_file = key
+  return changed
+end
+
 ---Register session autocmds. The save path uses both `VimLeave` and
 ---`SessionWritePost`; either alone is incomplete (see comments inside).
 function M.setup()
   local group = api.nvim_create_augroup("diffview_session", { clear = true })
+  -- The session loaded so far was written before; only later writes count.
+  session_file_changed()
 
   api.nvim_create_autocmd("SessionLoadPost", {
     group = group,
@@ -587,6 +609,7 @@ function M.setup()
     -- inside the autocmd hits `E814` (would leave only the autocmd
     -- window). The next tick drops into `[No Name]` instead.
     callback = function()
+      session_file_changed()
       vim.schedule(function()
         local _, created_paths = read_sidecar()
         cleanup(created_paths)
@@ -616,7 +639,11 @@ function M.setup()
   if vim.fn.exists("##SessionWritePost") ~= 0 then
     api.nvim_create_autocmd("SessionWritePost", {
       group = group,
-      callback = M.save,
+      callback = function()
+        if session_file_changed() then
+          M.save()
+        end
+      end,
     })
   end
 end
